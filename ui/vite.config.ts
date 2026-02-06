@@ -31,6 +31,7 @@ export default defineConfig(() => {
       outDir: path.resolve(here, "../dist/control-ui"),
       emptyOutDir: true,
       sourcemap: true,
+      chunkSizeWarningLimit: 600,
     },
     server: {
       host: true,

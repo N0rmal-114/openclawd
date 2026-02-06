@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -125,9 +127,9 @@ modelFile = resolveModelFile(modelDir, modelFile);
 tokensFile = resolveTokensFile(modelDir, tokensFile);
 dataDir = resolveDataDir(modelDir, dataDir);
 
-if (!modelFile || !tokensFile || !dataDir) {
+if (!modelFile || !tokensFile) {
   usage(
-    "Model directory is missing required files. Set SHERPA_ONNX_MODEL_FILE, SHERPA_ONNX_TOKENS_FILE, SHERPA_ONNX_DATA_DIR or pass --model-file/--tokens-file/--data-dir.",
+    "Model directory is missing required files. Set SHERPA_ONNX_MODEL_FILE, SHERPA_ONNX_TOKENS_FILE.",
   );
 }
 
@@ -154,15 +156,31 @@ if (process.platform === "darwin") {
 const outputPath = path.isAbsolute(output) ? output : path.join(process.cwd(), output);
 fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 
-const child = spawnSync(
-  bin,
-  [
+const argsList = [
     `--vits-model=${modelFile}`,
     `--vits-tokens=${tokensFile}`,
     `--vits-data-dir=${dataDir}`,
     `--output-filename=${outputPath}`,
-    text,
-  ],
+  ];
+
+  const lexiconFile = process.env.SHERPA_ONNX_LEXICON_FILE || path.join(modelDir, "lexicon.txt");
+  if (fs.existsSync(lexiconFile)) {
+    argsList.push(`--vits-lexicon=${lexiconFile}`);
+  }
+  const ruleFile = process.env.SHERPA_ONNX_RULE_FILE || path.join(modelDir, "rule.far");
+  if (fs.existsSync(ruleFile)) {
+    if (ruleFile.endsWith(".far")) {
+      argsList.push(`--tts-rule-fars=${ruleFile}`);
+    } else {
+      argsList.push(`--tts-rule-fsts=${ruleFile}`);
+    }
+  }
+
+  argsList.push(text);
+
+const child = spawnSync(
+  bin,
+  argsList,
   {
     stdio: "inherit",
     env,

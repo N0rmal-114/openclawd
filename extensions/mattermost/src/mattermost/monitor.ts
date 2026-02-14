@@ -1,5 +1,6 @@
 import type {
   ChannelAccountSnapshot,
+  ChatType,
   OpenClawConfig,
   ReplyPayload,
   RuntimeEnv,
@@ -37,6 +38,8 @@ import {
   rawDataToString,
   resolveThreadSessionKeys,
 } from "./monitor-helpers.js";
+import { resolveOncharPrefixes, stripOncharPrefix } from "./monitor-onchar.js";
+import { runWithReconnect } from "./reconnect.js";
 import { sendMessageMattermost } from "./send.js";
 
 export type MonitorMattermostOpts = {
@@ -49,7 +52,7 @@ export type MonitorMattermostOpts = {
   statusSink?: (patch: Partial<ChannelAccountSnapshot>) => void;
 };
 
-type FetchLike = typeof fetch;
+type FetchLike = (input: URL | RequestInfo, init?: RequestInit) => Promise<Response>;
 type MediaKind = "image" | "audio" | "video" | "document" | "unknown";
 
 type MattermostEventPayload = {
@@ -74,7 +77,6 @@ const RECENT_MATTERMOST_MESSAGE_TTL_MS = 5 * 60_000;
 const RECENT_MATTERMOST_MESSAGE_MAX = 2000;
 const CHANNEL_CACHE_TTL_MS = 5 * 60_000;
 const USER_CACHE_TTL_MS = 10 * 60_000;
-const DEFAULT_ONCHAR_PREFIXES = [">", "!"];
 
 const recentInboundMessages = createDedupeCache({
   ttlMs: RECENT_MATTERMOST_MESSAGE_TTL_MS,
@@ -102,42 +104,18 @@ function normalizeMention(text: string, mention: string | undefined): string {
   return text.replace(re, " ").replace(/\s+/g, " ").trim();
 }
 
-function resolveOncharPrefixes(prefixes: string[] | undefined): string[] {
-  const cleaned = prefixes?.map((entry) => entry.trim()).filter(Boolean) ?? DEFAULT_ONCHAR_PREFIXES;
-  return cleaned.length > 0 ? cleaned : DEFAULT_ONCHAR_PREFIXES;
-}
-
-function stripOncharPrefix(
-  text: string,
-  prefixes: string[],
-): { triggered: boolean; stripped: string } {
-  const trimmed = text.trimStart();
-  for (const prefix of prefixes) {
-    if (!prefix) {
-      continue;
-    }
-    if (trimmed.startsWith(prefix)) {
-      return {
-        triggered: true,
-        stripped: trimmed.slice(prefix.length).trimStart(),
-      };
-    }
-  }
-  return { triggered: false, stripped: text };
-}
-
 function isSystemPost(post: MattermostPost): boolean {
   const type = post.type?.trim();
   return Boolean(type);
 }
 
-function channelKind(channelType?: string | null): "dm" | "group" | "channel" {
+function channelKind(channelType?: string | null): ChatType {
   if (!channelType) {
     return "channel";
   }
   const normalized = channelType.trim().toUpperCase();
   if (normalized === "D") {
-    return "dm";
+    return "direct";
   }
   if (normalized === "G") {
     return "group";
@@ -145,8 +123,8 @@ function channelKind(channelType?: string | null): "dm" | "group" | "channel" {
   return "channel";
 }
 
-function channelChatType(kind: "dm" | "group" | "channel"): "direct" | "group" | "channel" {
-  if (kind === "dm") {
+function channelChatType(kind: ChatType): "direct" | "group" | "channel" {
+  if (kind === "direct") {
     return "direct";
   }
   if (kind === "group") {
@@ -469,11 +447,11 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       hasControlCommand,
     });
     const commandAuthorized =
-      kind === "dm"
+      kind === "direct"
         ? dmPolicy === "open" || senderAllowedForCommands
         : commandGate.commandAuthorized;
 
-    if (kind === "dm") {
+    if (kind === "direct") {
       if (dmPolicy === "disabled") {
         logVerboseMessage(`mattermost: drop dm (dmPolicy=disabled sender=${senderId})`);
         return;
@@ -524,7 +502,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       }
     }
 
-    if (kind !== "dm" && commandGate.shouldBlock) {
+    if (kind !== "direct" && commandGate.shouldBlock) {
       logInboundDrop({
         log: logVerboseMessage,
         channel: "mattermost",
@@ -547,7 +525,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       teamId,
       peer: {
         kind,
-        id: kind === "dm" ? senderId : channelId,
+        id: kind === "direct" ? senderId : channelId,
       },
     });
 
@@ -559,11 +537,11 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       parentSessionKey: threadRootId ? baseSessionKey : undefined,
     });
     const sessionKey = threadKeys.sessionKey;
-    const historyKey = kind === "dm" ? null : sessionKey;
+    const historyKey = kind === "direct" ? null : sessionKey;
 
     const mentionRegexes = core.channel.mentions.buildMentionRegexes(cfg, route.agentId);
     const wasMentioned =
-      kind !== "dm" &&
+      kind !== "direct" &&
       ((botUsername ? rawText.toLowerCase().includes(`@${botUsername.toLowerCase()}`) : false) ||
         core.channel.mentions.matchesMentionPatterns(rawText, mentionRegexes));
     const pendingBody =
@@ -590,7 +568,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       });
     };
 
-    const oncharEnabled = account.chatmode === "onchar" && kind !== "dm";
+    const oncharEnabled = account.chatmode === "onchar" && kind !== "direct";
     const oncharPrefixes = oncharEnabled ? resolveOncharPrefixes(account.oncharPrefixes) : [];
     const oncharResult = oncharEnabled
       ? stripOncharPrefix(rawText, oncharPrefixes)
@@ -598,7 +576,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
     const oncharTriggered = oncharResult.triggered;
 
     const shouldRequireMention =
-      kind !== "dm" &&
+      kind !== "direct" &&
       core.channel.groups.resolveRequireMention({
         cfg,
         channel: "mattermost",
@@ -615,7 +593,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       return;
     }
 
-    if (kind !== "dm" && shouldRequireMention && canDetectMention) {
+    if (kind !== "direct" && shouldRequireMention && canDetectMention) {
       if (!effectiveWasMentioned) {
         recordPendingHistory();
         return;
@@ -637,7 +615,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
     });
 
     const fromLabel = formatInboundFromLabel({
-      isGroup: kind !== "dm",
+      isGroup: kind !== "direct",
       groupLabel: channelDisplay || roomLabel,
       groupId: channelId,
       groupFallback: roomLabel || "Channel",
@@ -647,7 +625,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
 
     const preview = bodyText.replace(/\s+/g, " ").slice(0, 160);
     const inboundLabel =
-      kind === "dm"
+      kind === "direct"
         ? `Mattermost DM from ${senderName}`
         : `Mattermost message in ${roomLabel} from ${senderName}`;
     core.system.enqueueSystemEvent(`${inboundLabel}: ${preview}`, {
@@ -685,14 +663,24 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       });
     }
 
-    const to = kind === "dm" ? `user:${senderId}` : `channel:${channelId}`;
+    const to = kind === "direct" ? `user:${senderId}` : `channel:${channelId}`;
     const mediaPayload = buildMattermostMediaPayload(mediaList);
+    const inboundHistory =
+      historyKey && historyLimit > 0
+        ? (channelHistories.get(historyKey) ?? []).map((entry) => ({
+            sender: entry.sender,
+            body: entry.body,
+            timestamp: entry.timestamp,
+          }))
+        : undefined;
     const ctxPayload = core.channel.reply.finalizeInboundContext({
       Body: combinedBody,
+      BodyForAgent: bodyText,
+      InboundHistory: inboundHistory,
       RawBody: bodyText,
       CommandBody: bodyText,
       From:
-        kind === "dm"
+        kind === "direct"
           ? `mattermost:${senderId}`
           : kind === "group"
             ? `mattermost:group:${channelId}`
@@ -703,7 +691,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       AccountId: route.accountId,
       ChatType: chatType,
       ConversationLabel: fromLabel,
-      GroupSubject: kind !== "dm" ? channelDisplay || roomLabel : undefined,
+      GroupSubject: kind !== "direct" ? channelDisplay || roomLabel : undefined,
       GroupChannel: channelName ? `#${channelName}` : undefined,
       GroupSpace: teamId,
       SenderName: senderName,
@@ -718,14 +706,14 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       ReplyToId: threadRootId,
       MessageThreadId: threadRootId,
       Timestamp: typeof post.create_at === "number" ? post.create_at : undefined,
-      WasMentioned: kind !== "dm" ? effectiveWasMentioned : undefined,
+      WasMentioned: kind !== "direct" ? effectiveWasMentioned : undefined,
       CommandAuthorized: commandAuthorized,
       OriginatingChannel: "mattermost" as const,
       OriginatingTo: to,
       ...mediaPayload,
     });
 
-    if (kind === "dm") {
+    if (kind === "direct") {
       const sessionCfg = cfg.session;
       const storePath = core.channel.session.resolveStorePath(sessionCfg?.store, {
         agentId: route.agentId,
@@ -904,88 +892,102 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
 
   const connectOnce = async (): Promise<void> => {
     const ws = new WebSocket(wsUrl);
-    const onAbort = () => ws.close();
+    const onAbort = () => ws.terminate();
     opts.abortSignal?.addEventListener("abort", onAbort, { once: true });
 
-    return await new Promise((resolve) => {
-      ws.on("open", () => {
-        opts.statusSink?.({
-          connected: true,
-          lastConnectedAt: Date.now(),
-          lastError: null,
-        });
-        ws.send(
-          JSON.stringify({
-            seq: seq++,
-            action: "authentication_challenge",
-            data: { token: botToken },
-          }),
-        );
-      });
+    try {
+      return await new Promise((resolve, reject) => {
+        let opened = false;
 
-      ws.on("message", async (data) => {
-        const raw = rawDataToString(data);
-        let payload: MattermostEventPayload;
-        try {
-          payload = JSON.parse(raw) as MattermostEventPayload;
-        } catch {
-          return;
-        }
-        if (payload.event !== "posted") {
-          return;
-        }
-        const postData = payload.data?.post;
-        if (!postData) {
-          return;
-        }
-        let post: MattermostPost | null = null;
-        if (typeof postData === "string") {
+        ws.on("open", () => {
+          opened = true;
+          opts.statusSink?.({
+            connected: true,
+            lastConnectedAt: Date.now(),
+            lastError: null,
+          });
+          ws.send(
+            JSON.stringify({
+              seq: seq++,
+              action: "authentication_challenge",
+              data: { token: botToken },
+            }),
+          );
+        });
+
+        ws.on("message", async (data) => {
+          const raw = rawDataToString(data);
+          let payload: MattermostEventPayload;
           try {
-            post = JSON.parse(postData) as MattermostPost;
+            payload = JSON.parse(raw) as MattermostEventPayload;
           } catch {
             return;
           }
-        } else if (typeof postData === "object") {
-          post = postData as MattermostPost;
-        }
-        if (!post) {
-          return;
-        }
-        try {
-          await debouncer.enqueue({ post, payload });
-        } catch (err) {
-          runtime.error?.(`mattermost handler failed: ${String(err)}`);
-        }
-      });
-
-      ws.on("close", (code, reason) => {
-        const message = reason.length > 0 ? reason.toString("utf8") : "";
-        opts.statusSink?.({
-          connected: false,
-          lastDisconnect: {
-            at: Date.now(),
-            status: code,
-            error: message || undefined,
-          },
+          if (payload.event !== "posted") {
+            return;
+          }
+          const postData = payload.data?.post;
+          if (!postData) {
+            return;
+          }
+          let post: MattermostPost | null = null;
+          if (typeof postData === "string") {
+            try {
+              post = JSON.parse(postData) as MattermostPost;
+            } catch {
+              return;
+            }
+          } else if (typeof postData === "object") {
+            post = postData as MattermostPost;
+          }
+          if (!post) {
+            return;
+          }
+          try {
+            await debouncer.enqueue({ post, payload });
+          } catch (err) {
+            runtime.error?.(`mattermost handler failed: ${String(err)}`);
+          }
         });
-        opts.abortSignal?.removeEventListener("abort", onAbort);
-        resolve();
-      });
 
-      ws.on("error", (err) => {
-        runtime.error?.(`mattermost websocket error: ${String(err)}`);
-        opts.statusSink?.({
-          lastError: String(err),
+        ws.on("close", (code, reason) => {
+          const message = reason.length > 0 ? reason.toString("utf8") : "";
+          opts.statusSink?.({
+            connected: false,
+            lastDisconnect: {
+              at: Date.now(),
+              status: code,
+              error: message || undefined,
+            },
+          });
+          if (opened) {
+            resolve();
+          } else {
+            reject(new Error(`websocket closed before open (code ${code})`));
+          }
+        });
+
+        ws.on("error", (err) => {
+          runtime.error?.(`mattermost websocket error: ${String(err)}`);
+          opts.statusSink?.({
+            lastError: String(err),
+          });
+          ws.close();
         });
       });
-    });
+    } finally {
+      opts.abortSignal?.removeEventListener("abort", onAbort);
+    }
   };
 
-  while (!opts.abortSignal?.aborted) {
-    await connectOnce();
-    if (opts.abortSignal?.aborted) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-  }
+  await runWithReconnect(connectOnce, {
+    abortSignal: opts.abortSignal,
+    onError: (err) => {
+      runtime.error?.(`mattermost connection failed: ${String(err)}`);
+      opts.statusSink?.({ lastError: String(err), connected: false });
+    },
+    onReconnect: (delayMs) => {
+      runtime.log?.(`mattermost reconnecting in ${Math.round(delayMs / 1000)}s`);
+    },
+  });
 }
